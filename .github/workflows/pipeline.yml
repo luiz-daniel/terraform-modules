@@ -1,0 +1,166 @@
+name: Terraform Modules CI
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        description: 'Terraform version to use'
+        required: false
+        type: string
+        default: '1.6.0'
+      working_directory:
+        description: 'Working directory for Terraform operations'
+        required: false
+        type: string
+        default: '.'
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  detect-changes:
+    name: Detect Changed Modules
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.filter.outputs.changes }}
+      has_changes: ${{ steps.filter.outputs.has_changes }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v41
+        with:
+          files: |
+            lambda/**
+            dynamodb/**
+          dir_names: true
+          dir_names_max_depth: 1
+          json: true
+
+      - name: Filter module directories
+        id: filter
+        run: |
+          echo "Changed files: ${{ steps.changed-files.outputs.all_changed_files }}"
+          
+          # Get unique module directories
+          CHANGED_DIRS=$(echo '${{ steps.changed-files.outputs.all_changed_files }}' | jq -r '.[]' | cut -d'/' -f1 | sort -u | jq -R -s -c 'split("\n")[:-1]')
+          
+          echo "Detected modules: $CHANGED_DIRS"
+          echo "changes=$CHANGED_DIRS" >> $GITHUB_OUTPUT
+          
+          # Check if there are any changes
+          if [ "$CHANGED_DIRS" != "[]" ] && [ "$CHANGED_DIRS" != "" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+  terraform-check:
+    name: Terraform Check
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    strategy:
+      matrix:
+        module: ${{ fromJson(needs.detect-changes.outputs.modules) }}
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Terraform Format Check
+        id: fmt
+        run: |
+          echo "Checking format for module: ${{ matrix.module }}"
+          terraform fmt -check -recursive ${{ matrix.module }}
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: |
+          cd ${{ matrix.module }}
+          terraform init -backend=false
+
+      - name: Terraform Validate
+        id: validate
+        run: |
+          cd ${{ matrix.module }}
+          terraform validate
+
+      - name: TFLint Init
+        run: |
+          cd ${{ matrix.module }}
+          tflint --init
+
+      - name: TFLint
+        id: tflint
+        run: |
+          cd ${{ matrix.module }}
+          tflint --format compact
+        continue-on-error: true
+
+      - name: Comment PR (if applicable)
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Module: \`${{ matrix.module }}\`
+            #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### TFLint 🔍\`${{ steps.tflint.outcome }}\`
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Check Results
+        if: steps.fmt.outcome == 'failure' || steps.validate.outcome == 'failure' || steps.tflint.outcome == 'failure'
+        run: |
+          echo "::error::Terraform checks failed for module ${{ matrix.module }}"
+          exit 1
+
+  all-checks-passed:
+    name: All Checks Passed
+    runs-on: ubuntu-latest
+    needs: [detect-changes, terraform-check]
+    if: always()
+    steps:
+      - name: Check if all jobs succeeded
+        run: |
+          if [ "${{ needs.detect-changes.outputs.has_changes }}" == "false" ]; then
+            echo "No module changes detected, skipping checks"
+            exit 0
+          fi
+          
+          if [ "${{ needs.terraform-check.result }}" != "success" ]; then
+            echo "Terraform checks failed"
+            exit 1
+          fi
+          
+          echo "All checks passed!"

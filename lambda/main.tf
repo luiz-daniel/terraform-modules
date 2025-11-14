@@ -1,0 +1,1 @@
+# Lambda module main configuration
